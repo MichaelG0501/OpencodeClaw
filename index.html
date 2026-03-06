@@ -4,12 +4,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta property="og:title" content="HPC-Relay -- AI on Your HPC, From Your Phone">
+  <meta property="og:title" content="HPC-Relay -- AI on Your HPC, WSL, or macOS, From Your Phone">
   <meta property="og:description"
-    content="Control AI coding agents on HPC clusters via Telegram. Transfer files, switch models, manage sessions. No VPN needed.">
+    content="Control AI coding agents on HPC clusters, WSL setups, or lab macOS machines via Telegram. Transfer files, switch models, manage sessions. No VPN needed.">
   <meta property="og:type" content="website">
   <meta name="twitter:card" content="summary_large_image">
-  <title>HPC-Relay -- AI on Your HPC, From Your Phone</title>
+  <title>HPC-Relay -- AI on Your HPC, WSL, or macOS, From Your Phone</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link
@@ -969,11 +969,12 @@
     <div>
       <div class="hero-badge">Open Source -- HPC Research Tool</div>
       <h1>
-        <span class="line-1">Your HPC Cluster.</span>
+        <span class="line-1">Your Remote Environment.</span>
         <span class="line-2">From Your Phone.</span>
       </h1>
       <p class="hero-sub">
-        Control AI coding agents on HPC clusters via Telegram -- no VPN, no terminal, just your phone. Let AI help build
+        Control AI coding agents on HPC clusters, WSL setups, or lab macOS machines via Telegram -- no VPN, no terminal,
+        just your phone. Let AI help build
         your scripts,
         lauch jobs, debug and check results, simply send a message. Built for researchers and bioinformaticians.
       </p>
@@ -1030,8 +1031,8 @@
         <div class="pipeline-arrow encrypted">&harr;</div>
         <div class="pipeline-node">
           <div class="icon">&#x1F3DB;</div>
-          <div class="label">Cluster</div>
-          <div class="name">HPC Login Node</div>
+          <div class="label">Target Environment</div>
+          <div class="name">HPC / WSL / Local</div>
         </div>
         <div class="pipeline-arrow">&harr;</div>
         <div class="pipeline-node">
@@ -1082,7 +1083,7 @@
         <div class="feature-card reveal">
           <div class="feature-icon" style="background:rgba(16,185,129,0.1)">&#x1F4E6;</div>
           <h3>File Transfers</h3>
-          <p>Download files from HPC to Telegram with <code
+          <p>Download files from the target machine to Telegram with <code
               style="font-family:monospace;font-size:12px;color:var(--accent3)">@@send:path@@</code>. Upload from phone
             with <code style="font-family:monospace;font-size:12px;color:var(--accent3)">@@upload:file@@</code>.
             Supports wildcards for batch transfer.</p>
@@ -1214,7 +1215,7 @@
       <div class="model-note reveal">
         <strong>University students:</strong> GitHub Copilot Pro (free with .edu email) gives you GPT-5.3-codex, Claude
         Opus
-        4.6, Gemini 3.1 Pro, and more. Pair with this relay for frontier AI on your HPC -- <strong>completely
+        4.6, Gemini 3.1 Pro, and more. Pair with this relay for frontier AI on your target machine -- <strong>completely
           free</strong>.
       </div>
     </div>
@@ -1225,7 +1226,7 @@
     <div class="container">
       <div class="section-label reveal">Getting Started</div>
       <h2 class="section-title reveal">Quick Start</h2>
-      <p class="section-sub reveal">From zero to controlling your HPC from Telegram.</p>
+      <p class="section-sub reveal">From zero to controlling your workstation from Telegram.</p>
       <div class="steps">
 
         <div class="step reveal">
@@ -1234,8 +1235,10 @@
             <div class="step-connector"></div>
           </div>
           <div class="step-body">
-            <h3>Configure SSH Multiplexing</h3>
-            <p>Add ControlMaster config to <code style="font-family:monospace">~/.ssh/config</code> on your relay
+            <h3>Configure Target Environment Setting</h3>
+            <p>Set <code>CONNECTION_MODE</code> in <code>.env</code> (to <code>ssh</code>, <code>wsl</code>, or
+              <code>local</code>). If using SSH, add ControlMaster config to <code
+                style="font-family:monospace">~/.ssh/config</code> on your relay
               machine. Authenticate once with MFA -- the socket persists automatically.</p>
             <code>Host hpc&#10;  ControlMaster auto&#10;  ControlPath ~/.ssh/sockets/%r@%h:%p&#10;  ControlPersist 8h</code>
           </div>
@@ -1275,7 +1278,8 @@
           </div>
           <div class="step-body">
             <h3>Send Your First Command</h3>
-            <p>Open Telegram, message your bot. The AI executes on HPC and streams the response back -- formatted,
+            <p>Open Telegram, message your bot. The AI executes on your workstation and streams the response back --
+              formatted,
               chunked, readable.</p>
             <code>debug my RNA-seq pipeline in ~/analysis/pipeline.R</code>
           </div>
@@ -1382,7 +1386,7 @@
   </section>
 
   <footer>
-    <p>Built for HPC researchers &middot; <a href="https://github.com/MichaelG0501/hpc-relay">GitHub</a> &middot; BSD-3
+    <p>Built for researchers &middot; <a href="https://github.com/MichaelG0501/hpc-relay">GitHub</a> &middot; BSD-3
       License</p>
   </footer>
 

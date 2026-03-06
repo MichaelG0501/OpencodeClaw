@@ -2,7 +2,7 @@
 
 # HPC-Relay
 
-### Control AI Coding Agents on Your HPC Cluster -- From Your Phone
+### Control AI Coding Agents on Your HPC Cluster, WSL, or macOS -- From Your Phone
 
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue?style=flat-square&logo=python)](https://python.org)
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot%20API-26A5E4?style=flat-square&logo=telegram)](https://core.telegram.org/bots/api)
@@ -34,13 +34,13 @@
 
 ## Why HPC-Relay
 
-You’re a researcher. Your data live on an HPC cluster — but you’re not always sitting at your workstation.
+You’re a researcher or developer. Your data and code live on an HPC cluster, your WSL setup, or your lab macOS machine — but you’re not always sitting at your workstation.
 
 Sometimes you’re travelling, commuting, or just away from your laptop. You still want to run a quick analysis, check results, or ask an AI agent to sanity-check something. Or you want AI agent to start planning and implementing a long analysis while you take a rest.
 
 **HPC-Relay lets you do that from your phone.**
 
-Just message your HPC through Telegram.
+Just message your workstation or HPC through Telegram.
 
 * Run quick analyses
 * Ask AI agents to check outputs or data
@@ -55,10 +55,10 @@ No laptop. No logging in. Just send a message.
 ## How It Works
 
 ```
-Phone (Telegram)  -->  Relay Machine (Linux / WSL / macOS)  --SSH-->  HPC  -->  AI Agent  -->  Google Drive
+Phone (Telegram)  -->  Relay Machine  --[SSH or Local/WSL]-->  Target Environment  -->  AI Agent
 ```
 
-The relay runs on an **always-on machine** (campus Linux/macOS machine, or personal WSL connected to hpc domain via VPN). Your phone simply sends Telegram messages. The relay routes them over a pre-established SSH multiplexed socket to the HPC, executes your AI agent headlessly, and streams parsed responses back.
+The relay runs on an **always-on machine** (your campus machine, personal WSL, or macOS). Your phone simply sends Telegram messages. The relay routes them over a pre-established SSH multiplexed socket (for remote HPC) or executes them directly in bash (for WSL/Local), runs your AI agent headlessly, and streams parsed responses back.
 
 You authenticate **once**. Everything else is automatic.
 
@@ -70,8 +70,8 @@ You authenticate **once**. Everything else is automatic.
 |---|---|
 | **No VPN on phone** | Relay sits inside the authenticated network |
 | **AI session memory** | Parses & re-injects `sessionID` -- full context from cold start |
-| **File transfer** | Download files from HPC to Telegram (`@@send:path@@`) |
-| **File upload** | Upload files from HPC to cloud (`@@upload:file@@`) |
+| **File transfer** | Download files from the target machine to Telegram (`@@send:path@@`) |
+| **File upload** | Upload files from target to cloud (`@@upload:file@@`) |
 | **Wildcard fetch** | Send multiple files with glob patterns (e.g. `@@send:Auto*.png@@`) |
 | **Chat history viewer** | Generate interactive HTML viewer of all AI conversations |
 | **Agent-agnostic** | Works with OpenCode, Claude Code, Aider, or any headless CLI agent |
@@ -82,7 +82,7 @@ You authenticate **once**. Everything else is automatic.
 
 ### Talking to the AI Agent
 
-Simply type a message. It gets forwarded to the AI agent on your HPC, for example:
+Simply type a message. It gets forwarded to the AI agent on your target machine, for example:
 
 ```
 Generate an expression heatmap with random synthetic data.
@@ -95,13 +95,13 @@ Generate an expression heatmap with random synthetic data.
 | `@@model: <alias>@@` | Change the AI model for this message | `@@model: opus46@@ refactor my script` |
 | `@@session: <id>@@` | Switch to a specific AI session | `@@session: ses_abc123@@` / `@@session: new@@` |
 | `@@kill@@` or `!kill` | Kill the currently running AI process | `@@kill@@` |
-| `@@send: <path>@@` | Download a file from HPC to Telegram | `@@send: ~/results/plot.png@@` |
+| `@@send: <path>@@` | Download a file from target machine to Telegram | `@@send: ~/results/plot.png@@` |
 | `@@send: Auto*.png@@` | Download matching files (wildcard) | `@@send: /project/Auto*.png@@` |
-| `@@upload: file@@` | Upload a file from HPC to cloud | `@@upload: ~/data/input.csv@@` |
+| `@@upload: file@@` | Upload a file from target machine to cloud | `@@upload: ~/data/input.csv@@` |
 
 ### Shell Commands
 
-Prefix with `!` to run raw shell commands directly on HPC (bypasses the AI agent):
+Prefix with `!` to run raw shell commands directly on the target machine (bypasses the AI agent):
 
 ```
 !ls -la ~/results/
@@ -150,7 +150,7 @@ The AI retains full context within a session -- ask follow-ups without re-explai
 
 ## File Transfers
 
-### Download from HPC
+### Download from the Target Machine
 
 The AI automatically sends files it creates. You can also request files manually:
 
@@ -204,10 +204,10 @@ ssh -fN hpc   # enter password + MFA once
 1. Message [@BotFather](https://t.me/BotFather) on Telegram -> `/newbot` -> copy the **token**
 2. Message [@userinfobot](https://t.me/userinfobot) -> copy your **Chat ID**
 
-### Step 3 -- Install AI Agent on HPC
+### Step 3 -- Install AI Agent on Target Machine
 
 ```bash
-# Install Opencode on your hpc e.g.
+# Install Opencode on your target machine e.g.
 curl -fsSL https://opencode.ai/install | bash
 
 ```
@@ -229,9 +229,10 @@ cp .env.example .env
 ```env
 TELEGRAM_BOT_TOKEN=<your_bot_token>        # from @BotFather
 ALLOWED_CHAT_ID=<your_chat_id>             # from @userinfobot
-SSH_HOST=hpc                               # matches ~/.ssh/config Host
-OPENCODE_PATH=/path/to/opencode            # full path on HPC
-HPC_WORKDIR=/path/to/your/project          # working directory on HPC
+CONNECTION_MODE=ssh                        # Mode: `ssh` (in WSL/macOS connecting to HPC), `wsl` (in WSL connecting to WSL), `local` (in local connecting to local)
+SSH_HOST=hpc                               # matches ~/.ssh/config Host (if ssh)
+OPENCODE_PATH=/path/to/opencode            # full path on target
+WORKDIR=/path/to/your/project              # working directory on target
 DEFAULT_MODEL=github-copilot/gpt-4o        # default model
 ```
 
@@ -251,7 +252,7 @@ Open Telegram, message your bot:
 Generate an expression heatmap with random data.
 ```
 
-The AI executes on HPC and streams the response back -- formatted, chunked, and readable.
+The AI executes on the target machine and streams the response back -- formatted, chunked, and readable.
 
 ---
 
@@ -266,7 +267,7 @@ The included `tools/chat_viewer.py` script extracts conversation history from Op
 - Expandable tool call details
 - Token usage and cost tracking
 
-**Usage (run on HPC):**
+**Usage (run on target machine):**
 
 ```bash
 python3 tools/chat_viewer.py
@@ -297,7 +298,7 @@ HPC-Relay works with [OpenCode](https://opencode.ai), which routes to every majo
 | **xAI** | Grok Code Fast | GitHub Copilot Pro (students free) |
 | **Local** | LLaMA, Mistral via Ollama, MiniMax | Free |
 
-> Opencode now supports GitHub Copilot Pro login, giving generous usage on Claude Opus 4.6, Gemini 3.1 Pro, and more -- from your HPC, controlled from your phone. University student can access at zero cost.
+> Opencode now supports GitHub Copilot Pro login, giving generous usage on Claude Opus 4.6, Gemini 3.1 Pro, and more -- from your workflow, controlled from your phone. University student can access at zero cost.
 
 ---
 
@@ -377,9 +378,9 @@ Internet --> Telegram API --> Bot Token (secret)
                            |
                   shlex.quote(command) --> injection-proof
                            |
-                  SSH BatchMode socket --> pre-authenticated tunnel
+                   SSH BatchMode socket / direct bash --> execution
                            |
-                  HPC (your files, your compute)
+                  Target Machine (your files, your compute)
 ```
 
 ---
@@ -407,7 +408,7 @@ BSD-3 -- free for academic and personal use. See [LICENSE](LICENSE).
 
 <div align="center">
 
-**Built for researchers who want their HPC in their pocket.**
+**Built for researchers and developers who want their codebase in their pocket.**
 
 If this helped your workflow, please star the repo -- it helps others find it.
 

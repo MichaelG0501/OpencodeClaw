@@ -215,11 +215,19 @@ def _md_to_tg_html_inner(text: str) -> str:
 #  CONFIG  (loaded from .env -- copy .env.example to .env and fill in your values)
 # ================================================================
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
+ALLOWED_IDS = set()
+_raw_ids = os.environ.get("ALLOWED_CHAT_ID", "")
+for _id in _raw_ids.split(","):
+    if _id.strip():
+        try: ALLOWED_IDS.add(int(_id.strip()))
+        except: pass
+# Backwards compatibility if needed (optional)
+ALLOWED_CHAT_ID = next(iter(ALLOWED_IDS)) if ALLOWED_IDS else 0
 
 SSH_HOST = os.environ.get("SSH_HOST", "hpc")
+CONNECTION_MODE = os.environ.get("CONNECTION_MODE", "ssh").lower()
 OPENCODE = os.environ.get("OPENCODE_PATH", "opencode")
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "github-copilot/gpt-4o")
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "opencode/minimax-m2.5-free")
 
 MODEL_ALIASES = {
     "pickle": "opencode/big-pickle",
@@ -253,26 +261,25 @@ MODEL_ALIASES = {
 # All known full model names (values from aliases + common direct names)
 KNOWN_MODELS = set(MODEL_ALIASES.values()) | {DEFAULT_MODEL}
 
-WORKDIR = os.environ.get("HPC_WORKDIR", "~")
+WORKDIR = os.environ.get("WORKDIR", os.environ.get("HPC_WORKDIR", "~"))
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 RETRY_ON_TIMEOUT = True
 
-# HPC environment setup commands run before the AI agent on the remote shell.
-# Set HPC_SETUP_CMD in .env to whatever loads your dependencies.
+# Environment setup commands run before the AI agent on the remote shell.
+# Set SETUP_CMD in .env to whatever loads your dependencies.
 # Examples:
-#   Imperial College London: module purge && module load tools/dev && module load nodejs/20.13.1-GCCcore-13.3.0
 #   Generic Lmod cluster:    module load nodejs
 #   Conda environment:       source ~/miniconda3/etc/profile.d/conda.sh && conda activate myenv
 #   No modules needed:       (leave blank or omit)
-_setup_raw = os.environ.get("HPC_SETUP_CMD", "")
-HPC_SETUP_CMD = _setup_raw.strip() if _setup_raw.strip() else None
+_setup_raw = os.environ.get("SETUP_CMD", os.environ.get("HPC_SETUP_CMD", ""))
+SETUP_CMD = _setup_raw.strip() if _setup_raw.strip() else None
 
 # rclone destination for the @@upload:@@ directive (remote:path format).
 # Examples:  gdrive:HPC-Results    s3:mybucket/results    onedrive:Projects
 RCLONE_DEST = os.environ.get("RCLONE_DEST", "gdrive:HPC-Results")
 
 SESSIONS_FILE = os.environ.get(
-    "SESSIONS_FILE", os.path.expanduser("~/.hpc_relay_sessions.json")
+    "SESSIONS_FILE", os.path.expanduser(f"~/.hpc_relay_sessions_{CONNECTION_MODE}.json")
 )
 TG_CHUNK = 3800  # conservative; Telegram max is 4096
 
@@ -323,7 +330,7 @@ def _load_store() -> dict:
 
 
 def _save_store(d: dict):
-    tmp = SESSIONS_FILE + ".tmp"
+    tmp = f"{SESSIONS_FILE}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
         json.dump(d, f, indent=2)
     os.replace(tmp, SESSIONS_FILE)
@@ -491,6 +498,8 @@ def parse_message(text: str) -> dict:
 #  SSH HELPERS
 # ================================================================
 def _ssh_base() -> list:
+    if CONNECTION_MODE in ("wsl", "local"):
+        return []
     return [
         "ssh",
         "-o",
@@ -506,6 +515,8 @@ def _ssh_base() -> list:
 
 
 def _close_master():
+    if CONNECTION_MODE in ("wsl", "local"):
+        return
     try:
         subprocess.run(
             ["ssh", "-O", "exit", SSH_HOST],
@@ -517,23 +528,32 @@ def _close_master():
         pass
 
 
+def _safe_path(p: str) -> str:
+    """Safely quote a path while preserving ~ bash expansion."""
+    if p.startswith("~/"):
+        return f"${{HOME}}/{shlex.quote(p[2:])}"
+    if p == "~":
+        return "${HOME}"
+    return shlex.quote(p)
+
+
 def _oc_script(prompt, sid, model):
     sess = (
         f"--session {shlex.quote(sid)} "
         if sid and sid.startswith("ses")
         else ""
     )
-    setup = (HPC_SETUP_CMD + "\n") if HPC_SETUP_CMD else ""
+    setup = (SETUP_CMD + "\n") if SETUP_CMD else ""
     return (
         f"set -euo pipefail\n{setup}"
-        f"cd {shlex.quote(WORKDIR)}\n"
-        f"{shlex.quote(OPENCODE)} run -m {shlex.quote(model)} "
+        f"cd {_safe_path(WORKDIR)}\n"
+        f"{_safe_path(OPENCODE)} run -m {shlex.quote(model)} "
         f"--format json {sess}{shlex.quote(prompt)} 2>&1\n"
     )
 
 
 def _shell_script(cmd):
-    return f"cd {shlex.quote(WORKDIR)} && {{ {cmd} ; }} 2>&1\n"
+    return f"cd {_safe_path(WORKDIR)} && {{ {cmd} ; }} 2>&1\n"
 
 
 # ================================================================
@@ -568,7 +588,10 @@ def _parse_all(output) -> Tuple[Optional[str], Optional[str]]:
 #  SHELL EXEC
 # ================================================================
 async def exec_shell(cmd):
-    ssh_cmd = _ssh_base() + [f"timeout {int(REMOTE_TIMEOUT_SEC)} bash -ls"]
+    if CONNECTION_MODE in ("wsl", "local"):
+        ssh_cmd = _ssh_base() + ["timeout", str(int(REMOTE_TIMEOUT_SEC)), "bash", "-ls"]
+    else:
+        ssh_cmd = _ssh_base() + [f"timeout {int(REMOTE_TIMEOUT_SEC)} bash -ls"]
     proc = await asyncio.create_subprocess_exec(
         *ssh_cmd,
         stdin=asyncio.subprocess.PIPE,
@@ -593,7 +616,10 @@ async def run_opencode(
     prompt, chat_id, model, session_id, on_progress, on_text_chunk
 ):
     script = _oc_script(prompt, session_id, model)
-    ssh_cmd = _ssh_base() + [f"timeout {int(REMOTE_TIMEOUT_SEC)} bash -ls"]
+    if CONNECTION_MODE in ("wsl", "local"):
+        ssh_cmd = _ssh_base() + ["timeout", str(int(REMOTE_TIMEOUT_SEC)), "bash", "-ls"]
+    else:
+        ssh_cmd = _ssh_base() + [f"timeout {int(REMOTE_TIMEOUT_SEC)} bash -ls"]
 
     async def _once():
         proc = await asyncio.create_subprocess_exec(
@@ -760,9 +786,14 @@ async def run_opencode(
         update_chat(chat_id, session_id=returned_sid)
         _record_session(returned_sid)  # track in history
 
-    if rc != 0 and not final_text:
-        return f"{E.ERR} exit {rc}:\n{output[:1200]}", returned_sid
-    return (final_text or "[no output]").strip(), returned_sid
+    if not final_text:
+        if "NotFoundError" in output and "Session not found" in output:
+            raw_msg = f"{E.WARN} **Session does not exist on this machine!**\nIt seems you passed a session ID from the other bot. Please type `@@session: new@@` to start a new session on this host."
+        else:
+            raw_msg = f"{E.WARN} RC={rc}, No valid JSON text extracted.\nRAW OUTPUT:\n{output[:2000]}"
+        return raw_msg, returned_sid
+
+    return final_text.strip(), returned_sid
 
 
 # ================================================================
@@ -895,9 +926,9 @@ async def _process_file_request(update, action, pattern):
     # Safely resolve files using Python on HPC to prevent Bash wildcard
     # injection
     py_script = f"""import glob, os, sys
-try: os.chdir({repr(WORKDIR)})
+try: os.chdir(os.path.expanduser({repr(WORKDIR)}))
 except: pass
-matches = glob.glob({repr(pattern_clean)}, recursive=True)
+matches = glob.glob(os.path.expanduser({repr(pattern_clean)}), recursive=True)
 if not matches and os.path.exists({repr(pattern_clean)}):
     matches = [{repr(pattern_clean)}]
 for match in matches:
@@ -938,8 +969,8 @@ for match in matches:
     # -- RCLONE UPLOAD --
     if action == "upload":
         bash_cmds = []
-        if HPC_SETUP_CMD:
-            bash_cmds.append(HPC_SETUP_CMD)
+        if SETUP_CMD:
+            bash_cmds.append(SETUP_CMD)
         for f in files:
             bash_cmds.append(
                 f"rclone copy {shlex.quote(f)} {shlex.quote(RCLONE_DEST)}/ --progress"
@@ -1039,12 +1070,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     uid = update.effective_user.id if update.effective_user else None
     print(f"\n{'=' * 50}\nINCOMING  chat={chat_id}  user={uid}")
-    if chat_id != ALLOWED_CHAT_ID:
+    
+    # Allow if IT IS an allowed chat, OR an allowed user is speaking in another chat (e.g., a group)
+    if not (ALLOWED_IDS & {chat_id, uid}):
         return
 
     raw = (update.message.text or "").strip()
     if not raw:
         return
+
+    # Check mention
+    if raw.startswith("@"):
+        bot_username = context.bot.username
+        m_mention = re.match(r"^@(\w+)", raw)
+        if m_mention:
+            mentioned = m_mention.group(1)
+            # If not talking to us, ignore silently
+            if bot_username and mentioned.lower() != bot_username.lower():
+                return
+            # Strip our mention
+            raw = re.sub(r"^@\w+\s*", "", raw).strip()
+            if not raw:
+                # empty message after stripping
+                return
 
     # Fast-path kill command without backgrounding
     if raw.lower() == "!kill" or "@@kill@@" in raw.lower():
@@ -1390,19 +1438,20 @@ async def _handle_message_inner(update, context, chat_id, raw):
                 header
                 + f"<i>...continued ({elapsed}s)</i>\n\n"
                 + md_to_tg_html(remaining)
+                + f"\n\n{E.OK} <b>[Finished]</b>"
             )
         else:
             final_msg = (
                 header
-                + f"{E.OK} <b>Complete</b> ({elapsed}s) \u2014 see partial above."
+                + f"\n\n{E.OK} <b>[Finished]</b> ({elapsed}s) \u2014 see partial above."
             )
     elif partial_sent_len > 0:
         final_msg = (
             header
-            + f"{E.OK} <b>Complete</b> ({elapsed}s) \u2014 see partial above."
+            + f"\n\n{E.OK} <b>[Finished]</b> ({elapsed}s) \u2014 see partial above."
         )
     else:
-        final_msg = header + body_html
+        final_msg = header + body_html + f"\n\n{E.OK} <b>[Finished]</b>"
 
     await _send_html(update, final_msg)
     await _delete_or_check(status_msg)
