@@ -14,6 +14,9 @@ import asyncio
 import subprocess
 import html
 import traceback
+import threading
+import schedule
+from datetime import datetime, timedelta
 from typing import Optional, Tuple
 from pathlib import Path
 
@@ -23,7 +26,8 @@ from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
 # Load .env from the same directory as this script
-load_dotenv(Path(__file__).resolve().parent / ".env")
+SCRIPT_DIR = Path(__file__).resolve().parent
+load_dotenv(SCRIPT_DIR / ".env")
 
 
 # ================================================================
@@ -68,7 +72,7 @@ def md_to_tg_html(text: str) -> str:
     try:
         return _md_to_tg_html_inner(text)
     except Exception as exc:
-        print(f"  [md_to_tg_html error: {exc}]")
+        print(f"  [md_to_tg_html error:{exc}]")
         return html.escape(text)  # safe fallback
 
 
@@ -84,7 +88,8 @@ def _md_to_tg_html_inner(text: str) -> str:
         idx = len(code_blocks)
         if lang:
             code_blocks.append(
-                f'<pre><code class="language-{html.escape(lang)}">{code}</code></pre>'
+                f'<pre><code class="language-{html.escape(lang)}">{code}'
+                "</code></pre>"
             )
         else:
             code_blocks.append(f"<pre>{code}</pre>")
@@ -219,8 +224,10 @@ ALLOWED_IDS = set()
 _raw_ids = os.environ.get("ALLOWED_CHAT_ID", "")
 for _id in _raw_ids.split(","):
     if _id.strip():
-        try: ALLOWED_IDS.add(int(_id.strip()))
-        except: pass
+        try:
+            ALLOWED_IDS.add(int(_id.strip()))
+        except BaseException:
+            pass
 # Backwards compatibility if needed (optional)
 ALLOWED_CHAT_ID = next(iter(ALLOWED_IDS)) if ALLOWED_IDS else 0
 
@@ -271,15 +278,21 @@ RETRY_ON_TIMEOUT = True
 #   Generic Lmod cluster:    module load nodejs
 #   Conda environment:       source ~/miniconda3/etc/profile.d/conda.sh && conda activate myenv
 #   No modules needed:       (leave blank or omit)
-_setup_raw = os.environ.get("SETUP_CMD", os.environ.get("HPC_SETUP_CMD", ""))
+_setup_raw = os.environ.get(
+    "SETUP_CMD", os.environ.get("HPC_SETUP_CMD", "")
+)
 SETUP_CMD = _setup_raw.strip() if _setup_raw.strip() else None
 
 # rclone destination for the @@upload:@@ directive (remote:path format).
 # Examples:  gdrive:HPC-Results    s3:mybucket/results    onedrive:Projects
 RCLONE_DEST = os.environ.get("RCLONE_DEST", "gdrive:HPC-Results")
 
+TASKS_FILE = os.environ.get(
+    "TASKS_FILE", str(SCRIPT_DIR / "hpc_relay_scheduled_tasks.json")
+)
 SESSIONS_FILE = os.environ.get(
-    "SESSIONS_FILE", os.path.expanduser(f"~/.hpc_relay_sessions_{CONNECTION_MODE}.json")
+    "SESSIONS_FILE",
+    str(SCRIPT_DIR / f"hpc_relay_sessions_{CONNECTION_MODE}.json"),
 )
 TG_CHUNK = 3800  # conservative; Telegram max is 4096
 
@@ -307,14 +320,387 @@ SYSTEM_SUFFIX = (
     " Keep reply concise and highly structured."
     " IMPORTANT: Headless / non-interactive mode (`opencode run`)."
     " Do NOT invoke ask_questions tool"
-    " Unless explicitly told not to by the user, automatically output exactly `@@SEND_FILE: <filepath>@@` whenever you create or reference a small output file (like a png, pdf, or short dataset)."
-    "If need to ask follow-up questions, generate in Markdown formatted text"
-    " Only return text/code responses."
-)
+    " Unless explicitly told not to by the user, automatically output "
+    "exactly `@@SEND_FILE: <filepath>@@` whenever you create or reference "
+    "a small output file (like a png, pdf, or short dataset)."
+    " If detect user intention to schedule a recurring or future task or "
+    "ask something to be performed later, output exactly "
+    "`@@SCHEDULE: <time_format> | <task_prompt>@@` anywhere in your "
+    "response. For <time_format>, use `every X minutes/hours/days`, "
+    "`at HH:MM`, or `after X minutes/hours`.")
 
 MODEL_RE = re.compile(r"@@model:\s*(.+?)@@", re.IGNORECASE)
 SESSION_RE = re.compile(r"@@session:\s*(.+?)@@", re.IGNORECASE)
 SHELL_PREFIX = "!"
+
+
+# ================================================================
+#  SCHEDULED TASK MANAGER
+# ================================================================
+_scheduled_tasks = {}
+_scheduler_running = False
+_scheduler_thread = None
+_scheduler_lock = threading.Lock()
+
+
+def _load_scheduled_tasks() -> dict:
+    try:
+        with open(TASKS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_scheduled_tasks(tasks: dict):
+    tmp = f"{TASKS_FILE}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(tasks, f, indent=2)
+    os.replace(tmp, TASKS_FILE)
+
+
+def _run_scheduled_task(task_id: str, task_info: dict):
+    task = task_info.get("task", "")
+    chat_id = task_info.get("chat_id")
+    model = task_info.get("model", DEFAULT_MODEL)
+    session_id = task_info.get("session_id")
+
+    print(f"  [SCHEDULED TASK {task_id}] Running:{task[:50]}...")
+
+    prompt = task + SYSTEM_SUFFIX
+
+    async def _execute():
+        status_msg = None
+        if chat_id and _app:
+            try:
+                import html
+
+                status_msg = await _app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"{E.WAIT} <b>[Scheduled Task Started]</b>\n"
+                        "Connecting to HPC...\n"
+                        f"<i>Task:{html.escape(task[:50])}...</i>"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+        text_buf = []
+        last_edit_t = 0.0
+        last_output_t = time.time()
+        start_t = time.time()
+        done_event = asyncio.Event()
+
+        async def on_progress(s):
+            nonlocal last_edit_t, last_output_t
+            last_output_t = time.time()
+            now = time.time()
+            if now - last_edit_t < 1.0:
+                return
+            last_edit_t = now
+            if status_msg:
+                await _safe_edit(status_msg, f"{s} [{int(now - start_t)}s]")
+
+        async def on_text_chunk(delta):
+            nonlocal last_edit_t, last_output_t
+            last_output_t = time.time()
+            text_buf.append(delta)
+            now = time.time()
+            if (now - last_edit_t) < STREAM_EDIT_INTERVAL and len(
+                delta
+            ) < STREAM_MIN_DELTA:
+                return
+            last_edit_t = now
+            joined = "".join(text_buf)
+            mx = 3500
+            tail = joined[-mx:] if len(joined) > mx else joined
+            if status_msg:
+                await _safe_edit(
+                    status_msg,
+                    f"{E.WAIT} [Scheduled] Streaming... [{int(now - start_t)}s]\n\n{tail}",
+                )
+
+        try:
+            final, new_sid = await run_opencode(
+                prompt, chat_id, model, session_id, on_progress, on_text_chunk
+            )
+        except Exception as e:
+            final = f"{E.ERR} Task failed: {e}\n\n" + ("".join(text_buf))
+            new_sid = session_id
+        finally:
+            done_event.set()
+
+        if chat_id and _app:
+            try:
+                header = _header_html(
+                    model,
+                    _display_sid(
+                        new_sid or session_id or "scheduled",
+                        is_new=not session_id,
+                    ),
+                )
+                body = md_to_tg_html(final or "No output.")
+                final_msg = (
+                    header
+                    + body
+                    + f"\n\n{E.OK} <b>[Scheduled Task ({task_id.split('_')[1] if '_' in task_id else task_id}) Completed]</b>"
+                )
+
+                # Extract schedules within scheduled task
+                scheduled_tasks_to_add = re.findall(
+                    r"@@SCHEDULE:\s*(.+?)@@", final, re.IGNORECASE
+                )
+                scheduled_hint = ""
+                for sched_str in scheduled_tasks_to_add:
+                    parts = sched_str.split("|", 1)
+                    if len(parts) == 2:
+                        time_expr = parts[0].strip().lower()
+                        task_prompt = parts[1].strip()
+                        new_info = None
+                        if time_expr.startswith("every "):
+                            m_int = re.match(
+                                r"every\s+(\d+)\s+(minute|hour|day)", time_expr
+                            )
+                            if m_int:
+                                new_info = {
+                                    "type": "interval",
+                                    "interval": int(m_int.group(1)),
+                                    "unit": m_int.group(2) + "s",
+                                    "task": task_prompt,
+                                }
+                        elif time_expr.startswith("at "):
+                            m_at = re.match(
+                                r"at\s+(\d{1,2}):(\d{2})", time_expr
+                            )
+                            if m_at:
+                                new_info = {
+                                    "type": "daily",
+                                    "hour": int(m_at.group(1)),
+                                    "minute": int(m_at.group(2)),
+                                    "task": task_prompt,
+                                }
+                        elif time_expr.startswith(
+                            "after "
+                        ) or time_expr.startswith("in "):
+                            m_aft = re.match(
+                                r"(?:after|in)\s+(\d+)\s+(minute|hour)",
+                                time_expr,
+                            )
+                            if m_aft:
+                                val = int(m_aft.group(1))
+                                unit = m_aft.group(2)
+                                now = datetime.now()
+                                target = now + (
+                                    timedelta(minutes=val)
+                                    if unit == "minute"
+                                    else timedelta(hours=val)
+                                )
+                                new_info = {
+                                    "type": "once",
+                                    "hour": target.hour,
+                                    "minute": target.minute,
+                                    "task": task_prompt,
+                                }
+
+                        if new_info:
+                            new_task_id = f"task_{int(time.time())}_{len(scheduled_hint)}"
+                            tasks = _load_scheduled_tasks()
+                            tasks[new_task_id] = {
+                                "schedule": new_info,
+                                "task": new_info["task"],
+                                "chat_id": chat_id,
+                                "model": model,
+                                "session_id": new_sid,
+                                "created_at": datetime.datetime.now().isoformat(),
+                            }
+                            _save_scheduled_tasks(tasks)
+                            import html
+
+                            _schedule_job(new_task_id, tasks[new_task_id])
+
+                            if new_info["type"] == "interval":
+                                desc = f"every {new_info['interval']} {new_info['unit']}"
+                            elif new_info["type"] == "daily":
+                                desc = f"daily at {new_info['hour']:02d}:{new_info['minute']:02d}"
+                            else:
+                                desc = f"once at {new_info['hour']:02d}:{new_info['minute']:02d}"
+
+                            scheduled_hint += (
+                                f"\n\n{E.OK} <b>Scheduled Task Added!</b>\n"
+                                f"{E.TIME} {desc}\n{E.TOOL} Task: "
+                                f"<code>{html.escape(task_prompt[:50])}</code>"
+                            )
+
+                if status_msg:
+                    await _delete_or_check(status_msg)
+
+                await _app.bot.send_message(
+                    chat_id=chat_id,
+                    text=final_msg + scheduled_hint,
+                    parse_mode="HTML",
+                )
+
+                # Send files parsing
+                files_to_send = re.findall(
+                    r"@@SEND_FILE:\s*(.+?)@@", final, re.IGNORECASE
+                )
+                seen_files = set()
+                unique_files = [
+                    f.strip(" @")
+                    for f in files_to_send
+                    if not (f in seen_files or seen_files.add(f))
+                ]
+
+                if unique_files:
+
+                    class DummyMessage:
+                        def __init__(self, cid):
+                            self.chat_id = cid
+
+                        async def reply_text(self, text, parse_mode=None):
+                            await _app.bot.send_message(
+                                chat_id=self.chat_id,
+                                text=text,
+                                parse_mode=parse_mode,
+                            )
+
+                        async def reply_document(
+                            self, document, filename=None, caption=None
+                        ):
+                            await _app.bot.send_document(
+                                chat_id=self.chat_id,
+                                document=document,
+                                filename=filename,
+                                caption=caption,
+                            )
+
+                        async def reply_photo(self, photo, caption=None):
+                            await _app.bot.send_photo(
+                                chat_id=self.chat_id,
+                                photo=photo,
+                                caption=caption,
+                            )
+
+                    class DummyUpdate:
+                        def __init__(self, cid):
+                            self.message = DummyMessage(cid)
+
+                    for f in unique_files[:10]:
+                        try:
+                            await _process_file_request(
+                                DummyUpdate(chat_id), "send", f
+                            )
+                        except Exception as file_exp:
+                            print(
+                                f"  [SCHEDULED TASK {task_id}] Error sending file:{file_exp}"
+                            )
+
+            except Exception as e:
+                import traceback
+
+                traceback.print_exc()
+                print(
+                    f"  [SCHEDULED TASK {task_id}] Error sending message:{e}"
+                )
+
+    if _loop:
+        asyncio.run_coroutine_threadsafe(_execute(), _loop)
+
+
+def _schedule_job(task_id: str, task_info: dict):
+    info = task_info.get("schedule", {})
+    task_type = info.get("type")
+
+    if task_type in ("once", "daily"):
+        hour = info.get("hour")
+        minute = info.get("minute", 0)
+
+        if task_type == "once":
+            now = datetime.now()
+            target = now.replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            )
+            if target <= now:
+                # If target is past in today, push to tomorrow (this happens
+                # naturally for 'at' but not 'after', though 'after' generates
+                # future time)
+                target += timedelta(days=1)
+
+            delay = (target - now).total_seconds()
+            print(
+                f"  [SCHEDULED TASK] Will run ONCE in {delay/60:.1f} minutes at {hour:02d}:{minute:02d}"
+            )
+
+            def _delayed_run():
+                _run_scheduled_task(task_id, task_info)
+                # Remove self after run
+                tasks = _load_scheduled_tasks()
+                if task_id in tasks:
+                    del tasks[task_id]
+                    _save_scheduled_tasks(tasks)
+
+            # Start timer using the actual delay
+            threading.Timer(delay, _delayed_run).start()
+        else:
+            time_str = f"{hour:02d}:{minute:02d}"
+            print(f"  [SCHEDULED TASK] Will run DAILY at {time_str}")
+            schedule.every().day.at(time_str).do(
+                _run_scheduled_task, task_id, task_info
+            )
+
+    elif task_type == "interval":
+        interval = info.get("interval", 1)
+        unit = info.get("unit", "minutes")
+
+        if unit == "minutes":
+            schedule.every(interval).minutes.do(
+                _run_scheduled_task, task_id, task_info
+            )
+        elif unit == "hours":
+            schedule.every(interval).hours.do(
+                _run_scheduled_task, task_id, task_info
+            )
+        elif unit == "days":
+            schedule.every(interval).days.do(
+                _run_scheduled_task, task_id, task_info
+            )
+
+
+def _scheduler_worker():
+    while _scheduler_running:
+        schedule.run_pending()
+        time.sleep(1)
+
+
+def _start_scheduler():
+    global _scheduler_running, _scheduler_thread
+    if _scheduler_running:
+        return
+
+    _scheduler_running = True
+    _scheduler_thread = threading.Thread(target=_scheduler_worker, daemon=True)
+    _scheduler_thread.start()
+
+    tasks = _load_scheduled_tasks()
+    for task_id, task_info in tasks.items():
+        _schedule_job(task_id, task_info)
+    print(f"  [SCHEDULER] Started, loaded {len(tasks)} tasks")
+
+
+def _stop_scheduler():
+    global _scheduler_running
+    _scheduler_running = False
+
+
+_app = None
+_loop = None
+
+
+def set_app_context(app, loop):
+    global _app, _loop
+    _app = app
+    _loop = loop
 
 
 # ================================================================
@@ -405,10 +791,8 @@ try:
         title = row['title'] or ''
 
         info = []
-        if has_agent and row['agent']:
-            info.append(row['agent'])
-        if has_parent and row['parent_id']:
-            info.append("subagent")
+        if has_agent and row['agent']:            info.append(row['agent'])
+        if has_parent and row['parent_id']:            info.append("subagent")
 
         badge = f"[{info[0]}]" if info else ""
         print(f"{sid}|{title}|{badge}")
@@ -433,7 +817,7 @@ except Exception as e:
         raw = stdout.decode(errors="replace").strip()
         if not raw:
             print(
-                f"  [_fetch_hpc_sessions: empty output, stderr={stderr.decode(errors='replace')[:200]}]"
+                f"  [_fetch_hpc_sessions:empty output, stderr={stderr.decode(errors='replace')[:200]}]"
             )
             return []
         result = []
@@ -457,10 +841,10 @@ except Exception as e:
             if sid:
                 result.append((sid, title.strip()))
                 _record_session(sid)
-        print(f"  [_fetch_hpc_sessions: found {len(result)} sessions]")
+        print(f"  [_fetch_hpc_sessions:found {len(result)} sessions]")
         return result
     except Exception as exc:
-        print(f"  [_fetch_hpc_sessions error: {exc}]")
+        print(f"  [_fetch_hpc_sessions error:{exc}]")
         return []
 
 
@@ -490,6 +874,7 @@ def parse_message(text: str) -> dict:
         val = s.group(1).strip()
         out["session"] = "new" if val.lower() == "new" else val
         text = SESSION_RE.sub("", text)
+
     out["prompt"] = text.strip() or None
     return out
 
@@ -571,16 +956,34 @@ def _parse_ev(raw):
 
 def _parse_all(output) -> Tuple[Optional[str], Optional[str]]:
     sid = txt = None
+    last_tool_output = None
+    last_tool_name = None
+
     for raw in output.splitlines():
         ev = _parse_ev(raw)
         if not ev:
             continue
+
         if isinstance(ev.get("sessionID"), str):
             sid = ev["sessionID"]
-        if ev.get("type") == "text":
+
+        etype = ev.get("type")
+        if etype == "text":
             t = (ev.get("part") or {}).get("text")
             if isinstance(t, str) and t.strip():
                 txt = t
+        elif etype == "tool_use":
+            part = ev.get("part") or {}
+            state = part.get("state") or {}
+            if state.get("status") == "completed" and "output" in state:
+                out_str = str(state["output"]).strip()
+                if out_str:
+                    last_tool_name = part.get("tool", "tool")
+                    last_tool_output = out_str
+
+    if not txt and last_tool_output:
+        txt = f"*{last_tool_name} output:*\n```\n{last_tool_output}\n```"
+
     return sid, txt
 
 
@@ -589,7 +992,12 @@ def _parse_all(output) -> Tuple[Optional[str], Optional[str]]:
 # ================================================================
 async def exec_shell(cmd):
     if CONNECTION_MODE in ("wsl", "local"):
-        ssh_cmd = _ssh_base() + ["timeout", str(int(REMOTE_TIMEOUT_SEC)), "bash", "-ls"]
+        ssh_cmd = _ssh_base() + [
+            "timeout",
+            str(int(REMOTE_TIMEOUT_SEC)),
+            "bash",
+            "-ls",
+        ]
     else:
         ssh_cmd = _ssh_base() + [f"timeout {int(REMOTE_TIMEOUT_SEC)} bash -ls"]
     proc = await asyncio.create_subprocess_exec(
@@ -617,7 +1025,12 @@ async def run_opencode(
 ):
     script = _oc_script(prompt, session_id, model)
     if CONNECTION_MODE in ("wsl", "local"):
-        ssh_cmd = _ssh_base() + ["timeout", str(int(REMOTE_TIMEOUT_SEC)), "bash", "-ls"]
+        ssh_cmd = _ssh_base() + [
+            "timeout",
+            str(int(REMOTE_TIMEOUT_SEC)),
+            "bash",
+            "-ls",
+        ]
     else:
         ssh_cmd = _ssh_base() + [f"timeout {int(REMOTE_TIMEOUT_SEC)} bash -ls"]
 
@@ -694,18 +1107,21 @@ async def run_opencode(
             if isinstance(ev.get("sessionID"), str):
                 latest_sid = ev["sessionID"]
             etype = ev.get("type", "")
-            # Only store text events and small events in lines buffer
-            # tool_use events (apply_patch, task) can be 100KB+ and cause
-            # ValueError
+
+            part = ev.get("part") or {}
+            tool_name = part.get("tool", "")
+
             if etype == "text":
                 lines.append(decoded)
+            elif etype == "tool_use" and tool_name not in (
+                "task",
+                "apply_patch",
+            ):
+                if len(decoded) < 100000:
+                    lines.append(decoded)
             elif len(decoded) < 5000:
                 lines.append(decoded)
-            # Extract tool name from the actual opencode JSON structure
-            # Real format: {"type":"tool_use", "part":{"tool":"task",
-            # "state":{"input":{...}}}}
-            part = ev.get("part") or {}
-            tool_name = part.get("tool", "")  # the actual tool name
+
             # ename fallback not used # Removed unused variable 'ename'
 
             # ---- Subagent / task tool detection ----
@@ -788,7 +1204,12 @@ async def run_opencode(
 
     if not final_text:
         if "NotFoundError" in output and "Session not found" in output:
-            raw_msg = f"{E.WARN} **Session does not exist on this machine!**\nIt seems you passed a session ID from the other bot. Please type `@@session: new@@` to start a new session on this host."
+            raw_msg = (
+                f"{E.WARN} **Session does not exist on this machine!**\n"
+                "It seems you passed a session ID from the other bot. "
+                "Please type `@@session: new@@` to start a new session "
+                "on this host."
+            )
         else:
             raw_msg = f"{E.WARN} RC={rc}, No valid JSON text extracted.\nRAW OUTPUT:\n{output[:2000]}"
         return raw_msg, returned_sid
@@ -857,7 +1278,7 @@ def _smart_chunks(text, limit=TG_CHUNK):
             text = text[limit:]
         return chunks if chunks else [text]
     except Exception as exc:
-        print(f"  [_smart_chunks error: {exc}]")
+        print(f"  [_smart_chunks error:{exc}]")
         # Ultimate fallback: brute force split
         return [text[i:i + limit] for i in range(0, len(text), limit)]
 
@@ -874,7 +1295,7 @@ async def _safe_edit(msg, text, use_html=False):
                 except Exception:
                     pass
             else:
-                print(f"  [edit err: {e}]")
+                print(f"  [edit err:{e}]")
 
 
 async def _send_html(update, text):
@@ -902,7 +1323,7 @@ async def _send_html(update, text):
                 except Exception:
                     pass
     except Exception as exc:
-        print(f"  [_send_html fatal: {exc}]")
+        print(f"  [_send_html fatal:{exc}]")
         try:
             plain = re.sub(r"<[^>]+>", "", text)[:4000]
             await update.message.reply_text(plain or "[send error]")
@@ -1044,7 +1465,7 @@ cat "$abs"
                     # Fallback for dimensions/compression limits (Telegram
                     # rejects large wide/tall plots)
                     print(
-                        f"  [photo upload failed for {filename}: {ex1}. Retrying as document.]"
+                        f"  [photo upload failed for {filename}:{ex1}. Retrying as document.]"
                     )
                     await update.message.reply_document(
                         document=data,
@@ -1070,8 +1491,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     uid = update.effective_user.id if update.effective_user else None
     print(f"\n{'=' * 50}\nINCOMING  chat={chat_id}  user={uid}")
-    
-    # Allow if IT IS an allowed chat, OR an allowed user is speaking in another chat (e.g., a group)
+
+    # Allow if IT IS an allowed chat, OR an allowed user is speaking in
+    # another chat (e.g., a group)
     if not (ALLOWED_IDS & {chat_id, uid}):
         return
 
@@ -1125,6 +1547,66 @@ async def _run_in_background(update, context, chat_id, raw):
 
 
 async def _handle_message_inner(update, context, chat_id, raw):
+    # -- SCHEDULED TASK LIST --
+    if re.match(r"(?i)^@@scheduled?:@@$", raw.strip()):
+        tasks = _load_scheduled_tasks()
+        if not tasks:
+            await update.message.reply_text(
+                f"{E.WARN} No scheduled tasks.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            lines = []
+            for task_id, info in tasks.items():
+                sched = info.get("schedule", {})
+                if sched.get("type") in ("once", "daily"):
+                    hour = sched.get("hour", 0)
+                    minute = sched.get("minute", 0)
+                    sched_str = f"at {hour:02d}:{minute:02d}"
+                    if sched.get("type") == "daily":
+                        sched_str = f"daily {sched_str}"
+                    else:
+                        sched_str = f"once {sched_str}"
+                else:
+                    interval = sched.get("interval", 1)
+                    unit = sched.get("unit", "minutes")
+                    sched_str = f"every {interval} {unit}"
+
+                task_preview = info.get("task", "")[:40]
+                lines.append(
+                    f"  <code>{task_id}</code> {sched_str}\n    {html.escape(task_preview)}"
+                )
+
+            await update.message.reply_text(
+                f"{E.OK} <b>Scheduled Tasks:</b>\n\n"
+                + "\n\n".join(lines)
+                + "\n\n<i>Cancel task:</i> <code>@@unschedule: task_id@@</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    # -- UNSCHEDULE TASK --
+    m_un = re.match(r"(?i)^@@unschedule:\s*(.+?)@@$", raw.strip())
+    if m_un:
+        target_id = m_un.group(1).strip()
+        tasks = _load_scheduled_tasks()
+        if target_id in tasks:
+            del tasks[target_id]
+            _save_scheduled_tasks(tasks)
+            schedule.clear()
+            for tid, tinfo in tasks.items():
+                _schedule_job(tid, tinfo)
+            await update.message.reply_text(
+                f"{E.OK} Scheduled task <code>{html.escape(target_id)}</code> deleted.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.message.reply_text(
+                f"{E.ERR} Task ID <code>{html.escape(target_id)}</code> not found.",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
     # -- MANUAL FILE FETCH --
     m_send = re.match(r"(?i)^@@(send|upload):\s*(.+?)(?:@@)?$", raw.strip())
     if m_send:
@@ -1227,7 +1709,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
 
     # -- SHELL --
     if parsed["shell"]:
-        print(f"  SHELL: {parsed['shell']}")
+        print(f"  SHELL:{parsed['shell']}")
         status_msg = await update.message.reply_text(f"{E.SHELL} Running...")
         try:
             out = await exec_shell(parsed["shell"])
@@ -1405,7 +1887,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
                 + body
                 + f"\n\n{E.ERR} <i>Process terminated, partial output above</i>",
             )
-        final = f"{E.ERR} {type(e).__name__}: {str(e)[:200]}"
+        final = f"{E.ERR} {type(e).__name__}:{str(e)[:200]}"
         if joined.strip():
             final += (
                 f" ({len(joined)} chars captured, partial output sent above.)"
@@ -1427,7 +1909,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
 
     header = _header_html(model, display_sid)
     elapsed = int(time.time() - start_t)
-    print(f"  REPLY ({len(final)} chars, {elapsed}s): {final[:200]!r}")
+    print(f"  REPLY ({len(final)} chars, {elapsed}s):{final[:200]!r}")
 
     body_html = md_to_tg_html(final)
 
@@ -1453,7 +1935,86 @@ async def _handle_message_inner(update, context, chat_id, raw):
     else:
         final_msg = header + body_html + f"\n\n{E.OK} <b>[Finished]</b>"
 
-    await _send_html(update, final_msg)
+    # Process Scheduled tasks from AI response
+    scheduled_tasks_to_add = re.findall(
+        r"@@SCHEDULE:\s*(.+?)@@", final, re.IGNORECASE
+    )
+    scheduled_hint = ""
+    for sched_str in scheduled_tasks_to_add:
+        parts = sched_str.split("|", 1)
+        if len(parts) == 2:
+            time_expr = parts[0].strip().lower()
+            task_prompt = parts[1].strip()
+
+            task_info = None
+            if time_expr.startswith("every "):
+                m_int = re.match(
+                    r"every\s+(\d+)\s+(minute|hour|day)", time_expr
+                )
+                if m_int:
+                    task_info = {
+                        "type": "interval",
+                        "interval": int(m_int.group(1)),
+                        "unit": m_int.group(2) + "s",
+                        "task": task_prompt,
+                    }
+            elif time_expr.startswith("at "):
+                m_at = re.match(r"at\s+(\d{1,2}):(\d{2})", time_expr)
+                if m_at:
+                    task_info = {
+                        "type": "daily",
+                        "hour": int(m_at.group(1)),
+                        "minute": int(m_at.group(2)),
+                        "task": task_prompt,
+                    }
+            elif time_expr.startswith("after ") or time_expr.startswith("in "):
+                m_aft = re.match(
+                    r"(?:after|in)\s+(\d+)\s+(minute|hour)", time_expr
+                )
+                if m_aft:
+                    val = int(m_aft.group(1))
+                    unit = m_aft.group(2)
+                    now = datetime.now()
+                    target = now + (
+                        timedelta(minutes=val)
+                        if unit == "minute"
+                        else timedelta(hours=val)
+                    )
+                    task_info = {
+                        "type": "once",
+                        "hour": target.hour,
+                        "minute": target.minute,
+                        "task": task_prompt,
+                    }
+
+            if task_info:
+                task_id = f"task_{int(time.time())}_{len(scheduled_hint)}"
+                tasks = _load_scheduled_tasks()
+                tasks[task_id] = {
+                    "schedule": task_info,
+                    "task": task_info["task"],
+                    "chat_id": chat_id,
+                    "model": model,
+                    "session_id": sid,
+                    "created_at": datetime.now().isoformat(),
+                }
+                _save_scheduled_tasks(tasks)
+                _schedule_job(task_id, tasks[task_id])
+
+                if task_info["type"] == "interval":
+                    desc = f"every {task_info['interval']} {task_info['unit']}"
+                elif task_info["type"] == "daily":
+                    desc = f"daily at {task_info['hour']:02d}:{task_info['minute']:02d}"
+                else:
+                    desc = f"once at {task_info['hour']:02d}:{task_info['minute']:02d}"
+                scheduled_hint += (
+                    f"\n\n{E.OK} <b>Scheduled Task Added!</b>\n"
+                    f"{E.TIME} {desc}\n"
+                    f"{E.TOOL} Task:<code>"
+                    f"{html.escape(task_prompt[:50])}</code>"
+                )
+
+    await _send_html(update, final_msg + scheduled_hint)
     await _delete_or_check(status_msg)
 
     # Process AI file triggers unconditionally
@@ -1478,6 +2039,12 @@ async def _handle_message_inner(update, context, chat_id, raw):
 
 def main():
     app = Application.builder().token(TOKEN).build()
+    _start_scheduler()
+
+    async def on_startup(app):
+        set_app_context(app, asyncio.get_event_loop())
+
+    app.post_init = on_startup
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )

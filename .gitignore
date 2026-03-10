@@ -13,6 +13,7 @@ __pycache__/
 dist/
 build/
 *.egg
+.flake8
 
 # SSH
 .ssh/
@@ -39,3 +40,4 @@ opencode_chat_viewer/
 
 # Session data
 oc_sessions.json
+hpc_relay_sessions_ssh.json
